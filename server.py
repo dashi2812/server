@@ -1,12 +1,12 @@
 from flask import Flask, request, jsonify
 from flask_mail import Mail, Message
 from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from psycopg2 import connect, OperationalError
 from datetime import date
 from dotenv import load_dotenv
+from werkzeug.middleware.proxy_fix import ProxyFix
 import os, json, csv, time, hmac, hashlib, requests, logging
 
 # ==============================
@@ -22,9 +22,19 @@ logger = logging.getLogger(__name__)
 # ==============================
 app = Flask(__name__)
 
+# TRUST CLOUDFLARE + RENDER PROXIES
+app.wsgi_app = ProxyFix(
+    app.wsgi_app,
+    x_for=1,
+    x_proto=1,
+    x_host=1
+)
+
+# CORS (Frontend is Cloudflare proxied)
 CORS(
     app,
-    resources={r"/*": {"origins": r"https://(.*\.)?mysqft\.in"}}
+    resources={r"/submit": {"origins": r"https://(.*\.)?mysqft\.in"}},
+    supports_credentials=False
 )
 
 # ==============================
@@ -42,11 +52,18 @@ app.config.update(
 mail = Mail(app)
 
 # ==============================
-# RATE LIMIT
+# RATE LIMIT (CLOUDFLARE SAFE)
 # ==============================
+def limiter_key():
+    return (
+        request.headers.get("CF-Connecting-IP")
+        or request.headers.get("X-Forwarded-For", "").split(",")[0]
+        or request.remote_addr
+    )
+
 limiter = Limiter(
     app=app,
-    key_func=get_remote_address,
+    key_func=limiter_key,
     default_limits=[]
 )
 
@@ -54,7 +71,7 @@ limiter = Limiter(
 def ratelimit_handler(e):
     return jsonify({
         "error": "Too many requests",
-        "message": "Only 5 submissions allowed per 10 minutes per IP."
+        "message": "Only 5 submissions allowed per 10 minutes."
     }), 429
 
 # ==============================
@@ -68,12 +85,11 @@ def get_db():
         return None
 
 # ==============================
-# COMPANY CACHE (OPTIMAL)
+# COMPANY CACHE
 # ==============================
 COMPANY_CACHE = {}
 
 def load_companies():
-    """Load all active companies into memory"""
     conn = get_db()
     if not conn:
         return
@@ -93,8 +109,7 @@ def load_companies():
         COMPANY_CACHE.clear()
 
         for row in cur.fetchall():
-            subdomain = row[0]
-            COMPANY_CACHE[subdomain] = row[1:]
+            COMPANY_CACHE[row[0]] = row[1:]
 
         logger.info(f"Company cache loaded: {len(COMPANY_CACHE)} companies")
 
@@ -105,18 +120,20 @@ def load_companies():
         conn.close()
 
 # ==============================
-# SUBDOMAIN RESOLUTION
+# SUBDOMAIN RESOLUTION (FIXED)
 # ==============================
 def resolve_subdomain():
-    host = request.host.split(":")[0]
-    parts = host.split(".")
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    host = host.split(":")[0]
 
     if host in ("mysqft.in", "www.mysqft.in"):
         return "mysqft"
 
-    if len(parts) > 2:
-        return parts[0]
+    if host.endswith(".mysqft.in"):
+        sub = host.replace(".mysqft.in", "")
+        return sub if sub else "mysqft"
 
+    # fallback (Render domain, health checks)
     return "mysqft"
 
 # ==============================
@@ -191,7 +208,7 @@ def send_webhook(url, secret, payload):
         logger.error(f"Webhook failed: {e}")
 
 # ==============================
-# DAILY REPORT + CLEANUP
+# DAILY REPORT
 # ==============================
 def daily_report():
     conn = get_db()
@@ -256,8 +273,9 @@ def daily_report():
 def submit():
     try:
         subdomain = resolve_subdomain()
-        company = COMPANY_CACHE.get(subdomain)
+        logger.info(f"Resolved subdomain: {subdomain}")
 
+        company = COMPANY_CACHE.get(subdomain)
         if not company:
             return jsonify({"error": "Company not found"}), 403
 
@@ -293,14 +311,14 @@ def submit():
                 "lead": lead_data
             })
 
-        return jsonify({"message": "Lead stored"}), 200
+        return jsonify({"message": "Send Success!"}), 200
 
     except Exception:
         logger.exception("Unhandled submit error")
         return jsonify({"error": "Internal server error"}), 500
 
 # ==============================
-# MAIN
+# STARTUP (LOCAL ONLY)
 # ==============================
 if __name__ == "__main__":
     with app.app_context():
