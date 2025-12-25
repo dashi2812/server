@@ -1,12 +1,12 @@
 from flask import Flask, request, jsonify
 from flask_mail import Mail, Message
 from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from psycopg2 import connect, OperationalError
 from datetime import date
 from dotenv import load_dotenv
-from werkzeug.middleware.proxy_fix import ProxyFix
 import os, json, csv, time, hmac, hashlib, requests, logging
 
 # ==============================
@@ -22,17 +22,9 @@ logger = logging.getLogger(__name__)
 # ==============================
 app = Flask(__name__)
 
-app.wsgi_app = ProxyFix(
-    app.wsgi_app,
-    x_for=1,
-    x_proto=1,
-    x_host=1
-)
-
 CORS(
     app,
-    resources={r"/submit": {"origins": r"https://(.*\.)?mysqft\.in"}},
-    supports_credentials=False
+    resources={r"/*": {"origins": r"https://(.*\.)?mysqft\.in"}}
 )
 
 # ==============================
@@ -52,16 +44,9 @@ mail = Mail(app)
 # ==============================
 # RATE LIMIT
 # ==============================
-def limiter_key():
-    return (
-        request.headers.get("CF-Connecting-IP")
-        or request.headers.get("X-Forwarded-For", "").split(",")[0]
-        or request.remote_addr
-    )
-
 limiter = Limiter(
     app=app,
-    key_func=limiter_key,
+    key_func=get_remote_address,
     default_limits=[]
 )
 
@@ -69,7 +54,7 @@ limiter = Limiter(
 def ratelimit_handler(e):
     return jsonify({
         "error": "Too many requests",
-        "message": "Only 5 submissions allowed per 10 minutes."
+        "message": "Only 5 submissions allowed per 10 minutes per IP."
     }), 429
 
 # ==============================
@@ -83,11 +68,12 @@ def get_db():
         return None
 
 # ==============================
-# COMPANY CACHE
+# COMPANY CACHE (OPTIMAL)
 # ==============================
 COMPANY_CACHE = {}
 
 def load_companies():
+    """Load all active companies into memory"""
     conn = get_db()
     if not conn:
         return
@@ -107,13 +93,10 @@ def load_companies():
         COMPANY_CACHE.clear()
 
         for row in cur.fetchall():
-            COMPANY_CACHE[row[0]] = row[1:]
+            subdomain = row[0]
+            COMPANY_CACHE[subdomain] = row[1:]
 
-        logger.info(
-            "Company cache loaded (%d): %s",
-            len(COMPANY_CACHE),
-            list(COMPANY_CACHE.keys())
-        )
+        logger.info(f"Company cache loaded: {len(COMPANY_CACHE)} companies")
 
     except Exception as e:
         logger.error(f"load_companies error: {e}")
@@ -122,98 +105,34 @@ def load_companies():
         conn.close()
 
 # ==============================
-# DAILY REPORT
-# ==============================
-def daily_report():
-    logger.info("Running daily report")
-
-    conn = get_db()
-    if not conn:
-        return
-
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, company_name, email, plan
-            FROM companies
-            WHERE is_active=true
-              AND plan_expiry >= CURRENT_DATE
-        """)
-        companies = cur.fetchall()
-
-        for company_id, company_name, email, plan in companies:
-            cur.execute("""
-                SELECT lead_data, created_at
-                FROM company_leads
-                WHERE company_id=%s
-                  AND created_at::date = CURRENT_DATE
-            """, (company_id,))
-            rows = cur.fetchall()
-
-            if not rows:
-                continue
-
-            headers = set()
-            for data, _ in rows:
-                headers.update(data.keys())
-
-            csv_file = f"{company_id}.csv"
-            with open(csv_file, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(list(headers) + ["created_at"])
-                for data, created_at in rows:
-                    writer.writerow(
-                        [data.get(h, "") for h in headers] + [created_at]
-                    )
-
-            if plan in ("email", "all"):
-                send_email(email, csv_file)
-
-            cur.execute("""
-                DELETE FROM company_leads
-                WHERE company_id=%s
-                  AND created_at::date = CURRENT_DATE
-            """, (company_id,))
-            conn.commit()
-
-            os.remove(csv_file)
-
-    except Exception as e:
-        logger.error(f"Daily report error: {e}")
-        conn.rollback()
-    finally:
-        cur.close()
-        conn.close()
-
-# ==============================
-# LOAD CACHE AT GUNICORN STARTUP
+# LOAD CACHE AT IMPORT (GUNICORN)
 # ==============================
 with app.app_context():
     load_companies()
 
 # ==============================
-# SCHEDULER (ONE INSTANCE ONLY)
+# SCHEDULER (SAFE WITH --preload + 1 WORKER)
 # ==============================
 scheduler = BackgroundScheduler(timezone="UTC")
 
 if not scheduler.running:
-    scheduler.add_job(daily_report, "cron", hour=6)
     scheduler.add_job(load_companies, "cron", hour=6, minute=30)
     scheduler.start()
-    logger.info("Scheduler started (daily_report + load_companies)")
+    logger.info("Scheduler started")
+
 
 # ==============================
 # SUBDOMAIN RESOLUTION
 # ==============================
 def resolve_subdomain():
-    host = request.headers.get("X-Forwarded-Host", request.host)
-    host = host.split(":")[0]
+    host = request.host.split(":")[0]
+    parts = host.split(".")
 
     if host in ("mysqft.in", "www.mysqft.in"):
         return "mysqft"
 
-    if host.endswith(".mysqft.in"):
-        return host.replace(".mysqft.in", "")
+    if len(parts) > 2:
+        return parts[0]
 
     return "mysqft"
 
@@ -242,6 +161,111 @@ def save_lead(company_id, lead_data):
         conn.close()
 
 # ==============================
+# NOTIFICATIONS
+# ==============================
+def send_email(to_email, csv_file):
+    try:
+        with app.app_context():
+            msg = Message(
+                subject="Daily Lead Report",
+                recipients=[to_email],
+                body="Attached is today's lead report."
+            )
+            with open(csv_file, "r", encoding="utf-8") as f:
+                msg.attach("leads.csv", "text/csv", f.read())
+            mail.send(msg)
+    except Exception as e:
+        logger.error(f"Email failed: {e}")
+
+def send_discord(webhook, content):
+    if webhook:
+        try:
+            requests.post(webhook, json={"content": content}, timeout=5)
+        except Exception as e:
+            logger.error(f"Discord webhook failed: {e}")
+
+def send_webhook(url, secret, payload):
+    if not url:
+        return
+
+    try:
+        body = json.dumps(payload)
+        timestamp = str(int(time.time()))
+        signature = hmac.new(
+            secret.encode(),
+            msg=(timestamp + body).encode(),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Signature": signature,
+            "X-Timestamp": timestamp
+        }
+
+        requests.post(url, data=body, headers=headers, timeout=5)
+    except Exception as e:
+        logger.error(f"Webhook failed: {e}")
+
+# ==============================
+# DAILY REPORT + CLEANUP
+# ==============================
+def daily_report():
+    conn = get_db()
+    if not conn:
+        return
+
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, company_name, email, plan
+            FROM companies
+            WHERE is_active=true AND plan_expiry >= CURRENT_DATE
+        """)
+        companies = cur.fetchall()
+
+        for company_id, company_name, email, plan in companies:
+            cur.execute("""
+                SELECT lead_data, created_at
+                FROM company_leads
+                WHERE company_id=%s
+                  AND created_at::date = CURRENT_DATE
+            """, (company_id,))
+            rows = cur.fetchall()
+
+            if not rows:
+                continue
+
+            headers = set()
+            for data, _ in rows:
+                headers.update(data.keys())
+
+            csv_file = f"{company_id}.csv"
+            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(list(headers) + ["created_at"])
+                for data, created_at in rows:
+                    writer.writerow([data.get(h, "") for h in headers] + [created_at])
+
+            if plan in ("email", "all"):
+                send_email(email, csv_file)
+
+            cur.execute("""
+                DELETE FROM company_leads
+                WHERE company_id=%s
+                  AND created_at::date = CURRENT_DATE
+            """, (company_id,))
+            conn.commit()
+            os.remove(csv_file)
+
+    except Exception as e:
+        logger.error(f"Daily report error: {e}")
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
+
+# ==============================
 # ROUTE
 # ==============================
 @app.route("/submit", methods=["POST"])
@@ -249,12 +273,7 @@ def save_lead(company_id, lead_data):
 def submit():
     try:
         subdomain = resolve_subdomain()
-
         company = COMPANY_CACHE.get(subdomain)
-
-        if not company:
-            load_companies()
-            company = COMPANY_CACHE.get(subdomain)
 
         if not company:
             return jsonify({"error": "Company not found"}), 403
@@ -280,8 +299,21 @@ def submit():
         if not save_lead(company_id, lead_data):
             return jsonify({"error": "Failed to save lead"}), 500
 
+        if plan in ("discord", "all"):
+            text = "\n".join(f"**{k}**: {v}" for k, v in lead_data.items())
+            send_discord(discord, f"📩 New Lead for {company_name}\n{text}")
+
+        if plan in ("webhook", "all"):
+            send_webhook(webhook_url, webhook_secret, {
+                "event": "lead.created",
+                "company": company_name,
+                "lead": lead_data
+            })
+
         return jsonify({"message": "Send Success!"}), 200
 
     except Exception:
         logger.exception("Unhandled submit error")
         return jsonify({"error": "Internal server error"}), 500
+
+
