@@ -273,9 +273,10 @@ def daily_report():
 def submit():
     try:
         subdomain = resolve_subdomain()
-        logger.info(f"Resolved subdomain: {subdomain}")
+        # logger.info(f"Resolved subdomain: {subdomain}")
 
         company = COMPANY_CACHE.get(subdomain)
+        logger.info(company)
         if not company:
             return jsonify({"error": "Company not found"}), 403
 
@@ -328,5 +329,7 @@ if __name__ == "__main__":
     scheduler.add_job(daily_report, "cron", hour=6)
     scheduler.add_job(load_companies, "cron", hour=6, minute=30)
     scheduler.start()
-
+    logger.info(COMPANY_CACHE)
+    
     app.run(host="0.0.0.0", port=5000)
+
