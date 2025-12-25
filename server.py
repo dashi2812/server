@@ -1,12 +1,12 @@
 from flask import Flask, request, jsonify
 from flask_mail import Mail, Message
 from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from psycopg2 import connect, OperationalError
 from datetime import date
 from dotenv import load_dotenv
+from werkzeug.middleware.proxy_fix import ProxyFix
 import os, json, csv, time, hmac, hashlib, requests, logging
 
 # ==============================
@@ -22,9 +22,18 @@ logger = logging.getLogger(__name__)
 # ==============================
 app = Flask(__name__)
 
+# Gunicorn / Reverse proxy support
+app.wsgi_app = ProxyFix(
+    app.wsgi_app,
+    x_for=1,
+    x_proto=1,
+    x_host=1
+)
+
 CORS(
     app,
-    resources={r"/*": {"origins": r"https://(.*\.)?mysqft\.in"}}
+    resources={r"/submit": {"origins": r"https://(.*\.)?mysqft\.in"}},
+    supports_credentials=False
 )
 
 # ==============================
@@ -44,9 +53,16 @@ mail = Mail(app)
 # ==============================
 # RATE LIMIT
 # ==============================
+def limiter_key():
+    return (
+        request.headers.get("CF-Connecting-IP")
+        or request.headers.get("X-Forwarded-For", "").split(",")[0]
+        or request.remote_addr
+    )
+
 limiter = Limiter(
     app=app,
-    key_func=get_remote_address,
+    key_func=limiter_key,
     default_limits=[]
 )
 
@@ -68,12 +84,11 @@ def get_db():
         return None
 
 # ==============================
-# COMPANY CACHE (OPTIMAL)
+# COMPANY CACHE
 # ==============================
 COMPANY_CACHE = {}
 
 def load_companies():
-    """Load all active companies into memory"""
     conn = get_db()
     if not conn:
         return
@@ -93,10 +108,13 @@ def load_companies():
         COMPANY_CACHE.clear()
 
         for row in cur.fetchall():
-            subdomain = row[0]
-            COMPANY_CACHE[subdomain] = row[1:]
+            COMPANY_CACHE[row[0]] = row[1:]
 
-        logger.info(f"Company cache loaded: {len(COMPANY_CACHE)} companies")
+        logger.info(
+            "Company cache loaded (%d): %s",
+            len(COMPANY_CACHE),
+            list(COMPANY_CACHE.keys())
+        )
 
     except Exception as e:
         logger.error(f"load_companies error: {e}")
@@ -105,34 +123,17 @@ def load_companies():
         conn.close()
 
 # ==============================
-# LOAD CACHE AT IMPORT (GUNICORN)
-# ==============================
-with app.app_context():
-    load_companies()
-
-# ==============================
-# SCHEDULER (SAFE WITH --preload + 1 WORKER)
-# ==============================
-scheduler = BackgroundScheduler(timezone="UTC")
-
-if not scheduler.running:
-    scheduler.add_job(load_companies, "cron", hour=6, minute=30)
-    scheduler.start()
-    logger.info("Scheduler started")
-
-
-# ==============================
 # SUBDOMAIN RESOLUTION
 # ==============================
 def resolve_subdomain():
-    host = request.host.split(":")[0]
-    parts = host.split(".")
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    host = host.split(":")[0]
 
     if host in ("mysqft.in", "www.mysqft.in"):
         return "mysqft"
 
-    if len(parts) > 2:
-        return parts[0]
+    if host.endswith(".mysqft.in"):
+        return host.replace(".mysqft.in", "")
 
     return "mysqft"
 
@@ -208,9 +209,11 @@ def send_webhook(url, secret, payload):
         logger.error(f"Webhook failed: {e}")
 
 # ==============================
-# DAILY REPORT + CLEANUP
+# DAILY REPORT
 # ==============================
 def daily_report():
+    logger.info("Running daily report")
+
     conn = get_db()
     if not conn:
         return
@@ -220,7 +223,8 @@ def daily_report():
         cur.execute("""
             SELECT id, company_name, email, plan
             FROM companies
-            WHERE is_active=true AND plan_expiry >= CURRENT_DATE
+            WHERE is_active=true
+              AND plan_expiry >= CURRENT_DATE
         """)
         companies = cur.fetchall()
 
@@ -245,7 +249,9 @@ def daily_report():
                 writer = csv.writer(f)
                 writer.writerow(list(headers) + ["created_at"])
                 for data, created_at in rows:
-                    writer.writerow([data.get(h, "") for h in headers] + [created_at])
+                    writer.writerow(
+                        [data.get(h, "") for h in headers] + [created_at]
+                    )
 
             if plan in ("email", "all"):
                 send_email(email, csv_file)
@@ -266,6 +272,23 @@ def daily_report():
         conn.close()
 
 # ==============================
+# LOAD CACHE AT GUNICORN STARTUP
+# ==============================
+with app.app_context():
+    load_companies()
+
+# ==============================
+# SCHEDULER (ONE INSTANCE ONLY)
+# ==============================
+scheduler = BackgroundScheduler(timezone="UTC")
+
+if not scheduler.running:
+    scheduler.add_job(daily_report, "cron", hour=6)
+    scheduler.add_job(load_companies, "cron", hour=6, minute=30)
+    scheduler.start()
+    logger.info("Scheduler started")
+
+# ==============================
 # ROUTE
 # ==============================
 @app.route("/submit", methods=["POST"])
@@ -274,6 +297,10 @@ def submit():
     try:
         subdomain = resolve_subdomain()
         company = COMPANY_CACHE.get(subdomain)
+
+        if not company:
+            load_companies()
+            company = COMPANY_CACHE.get(subdomain)
 
         if not company:
             return jsonify({"error": "Company not found"}), 403
@@ -300,8 +327,11 @@ def submit():
             return jsonify({"error": "Failed to save lead"}), 500
 
         if plan in ("discord", "all"):
-            text = "\n".join(f"**{k}**: {v}" for k, v in lead_data.items())
-            send_discord(discord, f"📩 New Lead for {company_name}\n{text}")
+            send_discord(
+                discord,
+                f"📩 New Lead for {company_name}\n" +
+                "\n".join(f"**{k}**: {v}" for k, v in lead_data.items())
+            )
 
         if plan in ("webhook", "all"):
             send_webhook(webhook_url, webhook_secret, {
@@ -310,10 +340,8 @@ def submit():
                 "lead": lead_data
             })
 
-        return jsonify({"message": "Send Success!"}), 200
+        return jsonify({"message": "Lead stored"}), 200
 
     except Exception:
         logger.exception("Unhandled submit error")
         return jsonify({"error": "Internal server error"}), 500
-
-
