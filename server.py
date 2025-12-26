@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 # ==============================
 app = Flask(__name__)
 
-# Gunicorn / Reverse proxy support
 app.wsgi_app = ProxyFix(
     app.wsgi_app,
     x_for=1,
@@ -74,11 +73,16 @@ def ratelimit_handler(e):
     }), 429
 
 # ==============================
-# DATABASE
+# DATABASE (Neon-safe)
 # ==============================
 def get_db():
     try:
-        return connect(os.getenv("NEON_DATABASE_URL"))
+        return connect(
+            os.getenv("NEON_DATABASE_URL"),
+            connect_timeout=5,
+            sslmode="require",
+            application_name="mysqft-leads"
+        )
     except OperationalError as e:
         logger.error(f"DB connection failed: {e}")
         return None
@@ -87,8 +91,15 @@ def get_db():
 # COMPANY CACHE
 # ==============================
 COMPANY_CACHE = {}
+LAST_COMPANY_LOAD = 0
+CACHE_TTL = 300  # 5 minutes
 
-def load_companies():
+def load_companies(force=False):
+    global LAST_COMPANY_LOAD
+
+    if not force and time.time() - LAST_COMPANY_LOAD < CACHE_TTL:
+        return
+
     conn = get_db()
     if not conn:
         return
@@ -106,15 +117,11 @@ def load_companies():
         """)
 
         COMPANY_CACHE.clear()
-
         for row in cur.fetchall():
             COMPANY_CACHE[row[0]] = row[1:]
 
-        logger.info(
-            "Company cache loaded (%d): %s",
-            len(COMPANY_CACHE),
-            list(COMPANY_CACHE.keys())
-        )
+        LAST_COMPANY_LOAD = time.time()
+        logger.info("Company cache loaded (%d)", len(COMPANY_CACHE))
 
     except Exception as e:
         logger.error(f"load_companies error: {e}")
@@ -123,7 +130,7 @@ def load_companies():
         conn.close()
 
 # ==============================
-# SUBDOMAIN RESOLUTION
+# SUBDOMAIN
 # ==============================
 def resolve_subdomain():
     host = request.headers.get("X-Forwarded-Host", request.host)
@@ -209,7 +216,7 @@ def send_webhook(url, secret, payload):
         logger.error(f"Webhook failed: {e}")
 
 # ==============================
-# DAILY REPORT
+# DAILY REPORT (single worker only)
 # ==============================
 def daily_report():
     logger.info("Running daily report")
@@ -226,6 +233,7 @@ def daily_report():
             WHERE is_active=true
               AND plan_expiry >= CURRENT_DATE
         """)
+
         companies = cur.fetchall()
 
         for company_id, company_name, email, plan in companies:
@@ -272,14 +280,11 @@ def daily_report():
         conn.close()
 
 # ==============================
-# LOAD CACHE AT GUNICORN STARTUP
+# STARTUP
 # ==============================
 with app.app_context():
-    load_companies()
+    load_companies(force=True)
 
-# ==============================
-# SCHEDULER (ONE INSTANCE ONLY)
-# ==============================
 scheduler = BackgroundScheduler(timezone="UTC")
 
 if not scheduler.running:
@@ -299,7 +304,7 @@ def submit():
         company = COMPANY_CACHE.get(subdomain)
 
         if not company:
-            load_companies()
+            load_companies(force=True)
             company = COMPANY_CACHE.get(subdomain)
 
         if not company:
@@ -330,7 +335,7 @@ def submit():
             send_discord(
                 discord,
                 f"📩 New Lead for {company_name}\n" +
-                "\n".join(f"**{k}**: {v}" for k, v in lead_data.items())
+                "\n".join(f"{k}: {v}" for k, v in lead_data.items())
             )
 
         if plan in ("webhook", "all"):
