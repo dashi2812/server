@@ -4,11 +4,13 @@ from flask_limiter import Limiter
 from flask_cors import CORS
 # from apscheduler.schedulers.background import BackgroundScheduler
 from psycopg2 import connect, OperationalError
-from datetime import date
+# from datetime import date
 from dotenv import load_dotenv
 from werkzeug.middleware.proxy_fix import ProxyFix
 from collections import namedtuple
 import os, json, csv, time, hmac, hashlib, requests, logging, io
+from datetime import date, datetime
+
 
 # ==============================
 # ENV + LOGGING
@@ -310,6 +312,7 @@ def submit():
         })
 
     return jsonify(message="Send successfully!"), 200
+
 
 
 
