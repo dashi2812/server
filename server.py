@@ -29,9 +29,14 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 CORS(
     app,
-    resources={r"/submit": {"origins": r"https://(.*\.)?mysqft\.in"}},
+    resources={
+        r"/submit": {
+            "origins": r"^https://([a-z0-9-]+\.)?mysqft\.in$"
+        }
+    },
     supports_credentials=False
 )
+
 
 # ==============================
 # MAIL
@@ -293,7 +298,8 @@ def submit():
             "lead": lead
         })
 
-    return jsonify(message="Lead stored"), 200
+    return jsonify(message="Send successfully!"), 200
+
 
 
 
