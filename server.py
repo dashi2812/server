@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from flask_mail import Mail, Message
 from flask_limiter import Limiter
 from flask_cors import CORS
-from apscheduler.schedulers.background import BackgroundScheduler
+# from apscheduler.schedulers.background import BackgroundScheduler
 from psycopg2 import connect, OperationalError
 from datetime import date
 from dotenv import load_dotenv
@@ -249,15 +249,26 @@ def daily_report():
 # ==============================
 # SCHEDULER (single instance only)
 # ==============================
-if os.getenv("RUN_SCHEDULER") == "1":
-    scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(daily_report, "cron", hour=6)
-    scheduler.add_job(load_companies, "cron", hour=6, minute=30)
-    scheduler.start()
+# if os.getenv("RUN_SCHEDULER") == "1":
+#     scheduler = BackgroundScheduler(timezone="UTC")
+#     scheduler.add_job(daily_report, "cron", hour=6)
+#     scheduler.add_job(load_companies, "cron", hour=6, minute=30)
+#     scheduler.start()
 
 # ==============================
 # ROUTE
 # ==============================
+
+@app.route("/timer", methods=["GET"])
+@limiter.limit("5 per 10 minutes")
+
+def timer():
+    return {
+        "status": "ok",
+        "time": datetime.utcnow().isoformat()
+    }
+
+
 @app.route("/submit", methods=["POST"])
 @limiter.limit("5 per 10 minutes")
 def submit():
@@ -299,6 +310,7 @@ def submit():
         })
 
     return jsonify(message="Send successfully!"), 200
+
 
 
 
