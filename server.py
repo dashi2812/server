@@ -30,6 +30,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 CORS(
     app,
     resources={r"/submit": {"origins": ["https://mysqft.in", "https://*.mysqft.in"]}},
+    supports_credentials=False,
 )
 
 # ==============================
@@ -293,3 +294,4 @@ def submit():
         })
 
     return jsonify(message="Lead stored"), 200
+
