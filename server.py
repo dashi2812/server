@@ -27,17 +27,10 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-def cors_origin():
-    origin = request.headers.get("Origin")
-    if origin and origin.endswith(".mysqft.in"):
-        return origin
-    return None
-
-# Apply to all routes or just /submit
 CORS(
     app,
-    origins=cors_origin,
-    supports_credentials=False  # True if you send cookies/auth
+    resources={r"/submit": {"origins": r"https://(.*\.)?mysqft\.in"}},
+    supports_credentials=False
 )
 
 # ==============================
@@ -301,5 +294,6 @@ def submit():
         })
 
     return jsonify(message="Lead stored"), 200
+
 
 
