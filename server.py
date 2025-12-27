@@ -29,10 +29,23 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
  # r"http://localhost:\d+"
+ # r"/(submit|timer|load|report)": {
+ # "origins": r"^https://([a-z0-9-]+\.)?mysqft\.in$",
+ # "methods": ["GET", "POST", "OPTIONS"]
+ # }
 CORS(
     app,
     resources={
         r"/submit": {
+            "origins": r"^https://([a-z0-9-]+\.)?mysqft\.in$"
+        },
+        r"/timer": {
+            "origins": r"^https://([a-z0-9-]+\.)?mysqft\.in$"
+        },
+        r"/load": {
+            "origins": r"^https://([a-z0-9-]+\.)?mysqft\.in$"
+        },
+        r"/report": {
             "origins": r"^https://([a-z0-9-]+\.)?mysqft\.in$"
         }
     },
@@ -261,6 +274,23 @@ def daily_report():
 # ROUTE
 # ==============================
 
+@app.route("/report", methods=["GET"])
+@limiter.limit("5 per 10 minutes")
+def report():
+    daily_report()
+    return {
+        "status": "ok",
+    }
+
+@app.route("/load", methods=["GET"])
+@limiter.limit("5 per 10 minutes")
+def load():
+    load_companies()
+    return {
+        "status": "ok",
+    }
+
+
 @app.route("/timer", methods=["GET"])
 @limiter.limit("5 per 10 minutes")
 
@@ -312,6 +342,7 @@ def submit():
         })
 
     return jsonify(message="Send successfully!"), 200
+
 
 
 
